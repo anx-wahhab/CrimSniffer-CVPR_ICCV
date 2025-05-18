@@ -1,0 +1,238 @@
+import os
+import torch
+import torch.nn as nn
+from . import block
+import torch.nn.functional as F
+from scipy.ndimage import uniform_filter
+import numpy as np
+import random
+
+# class FeedbackLoopModule(nn.Module):
+#     def __init__(self, max_iterations=3, prob=0.5):
+#         super(FeedbackLoopModule, self).__init__()
+#         self.max_iterations = max_iterations
+#         self.prob = prob
+
+#     def forward(self, generated_image):
+#         refined_image = generated_image.clone()
+#         num_iterations = random.randint(1, self.max_iterations) 
+#         refined_image = self.refine(refined_image)  
+#         for _ in range(num_iterations - 1): 
+#             refined_image = self.refine(refined_image)
+#         return refined_image
+
+#     def refine(self, image):
+#         # Randomly apply perturbation with probability self.prob
+#         if random.random() < self.prob:
+#             perturbation_magnitude = random.uniform(0.05, 0.3)
+#             return image + torch.randn_like(image) * perturbation_magnitude
+#         else:
+#             return image
+
+class SelfSupervisedModule(nn.Module):
+    def __init__(self):
+        super(SelfSupervisedModule, self).__init__()
+
+    def forward(self, input_sketch, generated_image):
+        self_supervised_loss = self.calculate_loss(input_sketch, generated_image)
+        return self_supervised_loss
+
+    def calculate_ssim(self, img1, img2, K1=0.01, K2=0.03, win_size=11):
+        C1 = (K1 * 255) ** 2
+        C2 = (K2 * 255) ** 2
+
+        mu1 = F.avg_pool2d(img1, win_size, stride=1, padding=win_size//2)
+        mu2 = F.avg_pool2d(img2, win_size, stride=1, padding=win_size//2)
+        mu1_sq = mu1 ** 2
+        mu2_sq = mu2 ** 2
+        mu1_mu2 = mu1 * mu2
+
+        sigma1_sq = F.avg_pool2d(img1 ** 2, win_size, stride=1, padding=win_size//2) - mu1_sq
+        sigma2_sq = F.avg_pool2d(img2 ** 2, win_size, stride=1, padding=win_size//2) - mu2_sq
+        sigma12 = F.avg_pool2d(img1 * img2, win_size, stride=1, padding=win_size//2) - mu1_mu2
+
+        num = (2 * mu1_mu2 + C1) * (2 * sigma12 + C2)
+        denom = (mu1_sq + mu2_sq + C1) * (sigma1_sq + sigma2_sq + C2)
+
+        ssim_map = num / denom
+        ssim_score = torch.mean(ssim_map)
+
+        return ssim_score
+
+    def calculate_loss(self, input_sketch, generated_image):
+        input_sketch_gray = torch.mean(input_sketch, dim=1, keepdim=True)
+        generated_image_gray = torch.mean(generated_image, dim=1, keepdim=True)
+        
+        mse_loss = F.mse_loss(input_sketch_gray, generated_image_gray)
+        ssim_loss = 1 - self.calculate_ssim(input_sketch_gray, generated_image_gray)
+        
+        total_loss = mse_loss + ssim_loss
+        return total_loss
+
+class Generator(nn.Module):
+    def __init__(self, dimension, spatial_channel, num_iterations=3):
+        super(Generator, self).__init__()
+
+        self.dimension = dimension
+        self.spatial_channel = spatial_channel
+        self.num_iterations = num_iterations
+
+        self.encoder_channels = [self.spatial_channel, 56, 112, 224, 448]
+        self.encoder = nn.ModuleList()
+        self.skip_connections = nn.ModuleList()  # Add skip connections
+        for i in range(1, len(self.encoder_channels)):
+            self.encoder.append(block.Conv2D(self.encoder_channels[i-1], self.encoder_channels[i]))
+            self.skip_connections.append(nn.Conv2d(self.encoder_channels[i], self.encoder_channels[i-1], kernel_size=1))
+
+        self.resnet = nn.ModuleList()
+        self.n_resnet = 9
+        for i in range(self.n_resnet):
+            self.resnet.append(block.ResNet(self.encoder_channels[-1]))
+
+        self.decoder_channels = [self.encoder_channels[-1], 224, 112, 56, 3]
+        self.decoder = nn.ModuleList()
+        for i in range(1, len(self.decoder_channels)):
+            self.decoder.append(block.ConvTrans2D(self.decoder_channels[i-1], self.decoder_channels[i]))
+
+
+    def forward(self, x):
+        skip_connections = []
+        for i in range(len(self.encoder)):
+            x = self.encoder[i](x)
+            skip_connections.append(self.skip_connections[i](x))
+        for i in range(len(self.resnet)):
+            x = self.resnet[i](x)
+        for i in range(len(self.decoder)):
+            x = self.decoder[i](x)
+            if i < len(self.decoder) - 1:  # Add skip connections
+                skip = nn.functional.interpolate(skip_connections[-i - 1], size=x.size()[2:], mode='nearest')
+                x += skip
+        x = torch.sigmoid(x)
+        # Main synthesis task
+        generated_image = x
+
+        return generated_image
+
+
+class Discriminator(nn.Module):
+    def __init__(self, dimension, spatial_channel, avgpool):
+        super().__init__()
+
+        self.dimension = dimension
+        self.spatial_channel = spatial_channel
+        self.avgpool = avgpool
+
+        self.pool = nn.ModuleList()
+        for i in range(avgpool):
+            self.pool.append(nn.AvgPool2d(kernel_size=4, stride=2, padding=1))
+
+        self.dis_channels = [self.spatial_channel + 3, 64, 128, 256, 512]
+        self.dis = nn.ModuleList()
+        for i in range(1, len(self.dis_channels)):
+            self.dis.append(block.Conv2D(self.dis_channels[i-1], self.dis_channels[i], padding=1))  # Add padding
+
+    def forward(self, x):
+        for i in range(len(self.pool)):
+            x = self.pool[i](x)
+        for i in range(len(self.dis)):
+            x = self.dis[i](x)
+        x = torch.sigmoid(x)
+        return x
+
+class Module(nn.Module):
+
+    def __init__(self, generator=True, discriminator=False):
+        super().__init__()
+        self.G = None
+        self.D1 = None
+        self.D2 = None
+        self.D3 = None
+
+        self.dimension = 512
+        self.spatial_channel = 32
+        self.num_iterations = 3
+
+        if generator:
+            self.G = Generator(self.dimension, self.spatial_channel, self.num_iterations)
+        if discriminator:
+            self.D1 = Discriminator(self.dimension, self.spatial_channel, avgpool=0)
+            self.D2 = Discriminator(self.dimension, self.spatial_channel, avgpool=1)
+            self.D3 = Discriminator(self.dimension, self.spatial_channel, avgpool=2)
+            self.label_real = 1
+            self.label_fake = 0
+
+    def forward(self, x):
+        return self.generate(x)
+
+    def generate(self, spatial_map):
+        assert spatial_map.shape[1:] == (self.spatial_channel, self.dimension, self.dimension), f'[Image Synthesis : generate] Expected input spatial_map shape {(-1, self.spatial_channel, self.dimension, self.dimension)}, but received {spatial_map.shape}.'
+        generated_image = self.G(spatial_map) 
+        assert generated_image.shape[1:] == (3, self.dimension, self.dimension), f'[Image Synthesis : generate] Expected output shape {(1, 3, self.dimension, self.dimension)}, but yield {generated_image.shape}.'
+        return generated_image
+
+
+    def discriminate(self, spatial_map, photo):
+        assert spatial_map.shape[0] == photo.shape[0], f'[Image Synthesis : discriminate] Input spatial_map has {spatial_map.shape[0]} batch(es), but photo has {photo.shape[0]} batch(es).'
+        assert spatial_map.shape[1:] == (self.spatial_channel, self.dimension, self.dimension), f'[Image Synthesis : discriminate] Expected input spatial_map shape {(-1, self.spatial_channel, self.dimension, self.dimension)}, but received {spatial_map.shape}.'
+        assert photo.shape[1:] == (3, self.dimension, self.dimension), f'[Image Synthesis : discriminate] Expected input photo shape {(-1, 3, self.dimension, self.dimension)}, but received {photo.dimension}.'
+
+        spatial_map_photo = torch.cat((spatial_map, photo), 1)
+        patch_D1 = self.D1(spatial_map_photo)
+        patch_D2 = self.D2(spatial_map_photo)
+        patch_D3 = self.D3(spatial_map_photo)
+        return patch_D1, patch_D2, patch_D3
+
+    path_dict = {
+        'G' : 'generator.pth',
+        'D1' : 'discriminator_1.pth',
+        'D2' : 'discriminator_2.pth',
+        'D3' : 'discriminator_3.pth'
+    }
+
+    def get_path(self, path, key):
+        return os.path.join(path, self.path_dict[key])
+
+    def save_G(self, path):
+        torch.save(self.G.state_dict(), path)
+        print(f'Saved Image Synthesis : G to {path}')
+
+    def save_D1(self, path):
+        torch.save(self.D1.state_dict(), path)
+        print(f'Saved Image Synthesis : D1 to {path}')
+
+    def save_D2(self, path):
+        torch.save(self.D2.state_dict(), path)
+        print(f'Saved Image Synthesis : D2 to {path}')
+
+    def save_D3(self, path):
+        torch.save(self.D3.state_dict(), path)
+        print(f'Saved Image Synthesis : D3 to {path}')
+
+    def save(self, path):
+        os.makedirs(path, exist_ok=True)
+        if self.G: self.save_G(self.get_path(path, 'G'))
+        if self.D1: self.save_D1(self.get_path(path, 'D1'))
+        if self.D2: self.save_D2(self.get_path(path, 'D2'))
+        if self.D3: self.save_D3(self.get_path(path, 'D3'))
+
+    def load_G(self, path, map_location=torch.device('cpu')):
+        self.G.load_state_dict(torch.load(path, map_location=map_location))
+        print(f'Loaded Image Synthesis : G from {path}')
+
+    def load_D1(self, path, map_location=torch.device('cpu')):
+        self.D1.load_state_dict(torch.load(path, map_location=map_location))
+        print(f'Loaded Image Synthesis : D1 from {path}')
+
+    def load_D2(self, path, map_location=torch.device('cpu')):
+        self.D2.load_state_dict(torch.load(path, map_location=map_location))
+        print(f'Loaded Image Synthesis : D2 from {path}')
+
+    def load_D3(self, path, map_location=torch.device('cpu')):
+        self.D3.load_state_dict(torch.load(path, map_location=map_location))
+        print(f'Loaded Image Synthesis : D3 from {path}')
+
+    def load(self, path, map_location=torch.device('cpu')):
+        if self.G: self.load_G(self.get_path(path, 'G'), map_location=map_location)
+        if self.D1: self.load_D1(self.get_path(path, 'D1'), map_location=map_location)
+        if self.D2: self.load_D2(self.get_path(path, 'D2'), map_location=map_location)
+        if self.D3: self.load_D3(self.get_path(path, 'D3'), map_location=map_location)
